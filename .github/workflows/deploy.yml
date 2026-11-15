@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 permissions:
   id-token: write
@@ -16,22 +17,77 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # Step 1: Download repository code
       - name: Checkout GitHub Repository
         uses: actions/checkout@v4
 
+      # Step 2: Debug GitHub OIDC token claims
+      - name: Debug GitHub OIDC Claims
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Requesting GitHub OIDC token..."
+
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || \
+             [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "GitHub OIDC environment variables are missing."
+            exit 1
+          fi
+
+          TOKEN=$(curl -fsS \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" \
+            | jq -r '.value')
+
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "Failed to obtain OIDC token."
+            exit 1
+          fi
+
+          echo "GitHub OIDC token obtained."
+          echo "Displaying safe token claims only:"
+
+          PAYLOAD=$(echo "$TOKEN" | cut -d '.' -f2)
+
+          python3 -c '
+          import sys, json, base64
+          payload = sys.argv[1]
+          payload += "=" * ((4 - len(payload) % 4) % 4)
+          data = json.loads(base64.urlsafe_b64decode(payload))
+          claims = {
+              "iss": data.get("iss"),
+              "aud": data.get("aud"),
+              "sub": data.get("sub")
+          }
+          print(json.dumps(claims, indent=2))
+          ' "$PAYLOAD"
+
+          unset TOKEN PAYLOAD
+
+      # Step 3: Authenticate with AWS using OIDC
       - name: Configure AWS Credentials using OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
+      # Step 4: Verify AWS authentication
+      - name: Verify AWS Identity
+        run: |
+          aws sts get-caller-identity
+
+      # Step 5: Deploy application using AWS Systems Manager
       - name: Deploy Application using AWS SSM
+        shell: bash
         env:
           EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
         run: |
-          set -e
+          set -euo pipefail
 
           APP_URL="https://raw.githubusercontent.com/jaisaikumar002-debug/hello-world-cicd/main/index.html"
+
+          echo "Starting EC2 deployment..."
 
           PARAMETERS=$(jq -n --arg url "$APP_URL" '{
             commands: [
@@ -43,7 +99,7 @@ jobs:
               "systemctl enable nginx",
               "systemctl restart nginx",
               "systemctl is-active nginx",
-              "curl -fsS http://localhost/ | grep -qi 'Hello World'"
+              "curl -fsS http://localhost/ | grep -qi \"Hello World\""
             ]
           }')
 
@@ -58,7 +114,8 @@ jobs:
 
           STATUS="Pending"
 
-          for i in {1..30}; do
+          for i in {1..36}; do
+
             STATUS=$(aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \
               --instance-id "$EC2_INSTANCE_ID" \
@@ -82,15 +139,17 @@ jobs:
 
           if [ "$STATUS" != "Success" ]; then
             echo "Deployment failed or timed out."
+
             aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \
               --instance-id "$EC2_INSTANCE_ID" \
               --query '{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}' \
               --output json || true
+
             exit 1
           fi
 
-          echo "Deployment completed successfully."
+          echo "Deployment completed successfully!"
 
           aws ssm get-command-invocation \
             --command-id "$COMMAND_ID" \
