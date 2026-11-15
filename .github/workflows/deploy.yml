@@ -1,59 +1,99 @@
 
 name: Deploy Hello World to AWS EC2
 
-# Trigger deployment whenever code is pushed to main
 on:
   push:
     branches:
       - main
 
-# Permissions required for GitHub OIDC authentication
 permissions:
   id-token: write
   contents: read
 
 jobs:
   deploy:
-    name: Deploy Application
+    name: Deploy Application to EC2
     runs-on: ubuntu-latest
 
     steps:
-
-      # Step 1: Download repository code
-      - name: Checkout Code
+      - name: Checkout GitHub Repository
         uses: actions/checkout@v4
 
-      # Step 2: Authenticate GitHub with AWS
-      - name: Configure AWS Credentials
+      - name: Configure AWS Credentials using OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      # Step 3: Deploy application to EC2 using SSM
-      - name: Deploy to EC2
+      - name: Deploy Application using AWS SSM
         env:
           EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
         run: |
+          set -e
+
+          APP_URL="https://raw.githubusercontent.com/jaisaikumar002-debug/hello-world-cicd/main/index.html"
+
+          PARAMETERS=$(jq -n --arg url "$APP_URL" '{
+            commands: [
+              "set -e",
+              "dnf install nginx -y",
+              "mkdir -p /usr/share/nginx/html",
+              ("curl -fsSL " + $url + " -o /tmp/index.html"),
+              "install -m 0644 /tmp/index.html /usr/share/nginx/html/index.html",
+              "systemctl enable nginx",
+              "systemctl restart nginx",
+              "systemctl is-active nginx",
+              "curl -fsS http://localhost/ | grep -qi 'Hello World'"
+            ]
+          }')
+
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$EC2_INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
-            --parameters 'commands=[
-              "set -e",
-              "curl -fsSL https://raw.githubusercontent.com/OWNER/REPO/main/index.html -o /tmp/index.html",
-              "sudo install -o www-data -g www-data -m 0644 /tmp/index.html /var/www/html/index.html"
-            ]' \
+            --parameters "$PARAMETERS" \
             --query "Command.CommandId" \
             --output text)
 
-          echo "Deployment command: $COMMAND_ID"
+          echo "SSM Command ID: $COMMAND_ID"
 
-          # Wait for deployment to complete
-          aws ssm wait command-executed \
-            --command-id "$COMMAND_ID" \
-            --instance-id "$EC2_INSTANCE_ID"
+          STATUS="Pending"
 
-          # Display deployment result
+          for i in {1..30}; do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --query "Status" \
+              --output text 2>/dev/null || true)
+
+            echo "Deployment status: $STATUS"
+
+            if [ "$STATUS" = "Success" ]; then
+              break
+            fi
+
+            if [ "$STATUS" = "Failed" ] || \
+               [ "$STATUS" = "Cancelled" ] || \
+               [ "$STATUS" = "TimedOut" ]; then
+              break
+            fi
+
+            sleep 5
+          done
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "Deployment failed or timed out."
+            aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --query '{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}' \
+              --output json || true
+            exit 1
+          fi
+
+          echo "Deployment completed successfully."
+
           aws ssm get-command-invocation \
             --command-id "$COMMAND_ID" \
-            --instance-id "$EC2_INSTANCE_ID"
+            --instance-id "$EC2_INSTANCE_ID" \
+            --query '{Status:Status,Output:StandardOutputContent}' \
+            --output json
